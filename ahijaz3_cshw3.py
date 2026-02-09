@@ -295,6 +295,35 @@ Your response: """
             
     print(f"Prepared {count} grading requests.")
 
+
+def calculate_accuracy(filename):
+    """
+    Parses the final grading batch file and calculates the accuracy percentage.
+    """
+    print(f"\nCalculating Accuracy for: {filename}")
+    correct_count = 0
+    total_count = 0
+    
+    with open(filename, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                #Parse the OpenAI Batch Result (Line)
+                batch_entry = json.loads(line)
+                
+                #Extract the 'content' string from the response
+                content_str = batch_entry['response']['body']['choices'][0]['message']['content']
+                
+                #Parse the Judge's JSON output
+                judge_result = json.loads(content_str)
+                
+                if judge_result.get('score') is True:
+                    correct_count += 1
+                total_count += 1
+            except Exception as e:
+                continue
+        percentage = (correct_count / total_count) * 100
+        print(f"Score: {correct_count}/{total_count} ({percentage:.2f}%)")
+
 def check_and_download_batch(batch_id, output_filename):
     """
     Checks if a batch job is complete and downloads the results.
@@ -321,9 +350,10 @@ def check_and_download_batch(batch_id, output_filename):
 def main():
     #CLI Arguments Setup
     parser = argparse.ArgumentParser(description="RAG Pipeline")
-    parser.add_argument('--mode', type=str, choices=['batch', 'serial', 'grade', 'download'], required=True)
+    parser.add_argument('--mode', type=str, choices=['batch', 'serial', 'grade', 'download', 'score'], required=True)
     parser.add_argument('--batch_id', type=str)
     parser.add_argument('--model_name', type=str, choices=['nano', 'qwen'])
+    parser.add_argument('--output_file', type=str) #To hopefully fit the rubric naming scheme
     args = parser.parse_args()
 
     # Define Rubric Filenames
@@ -363,40 +393,65 @@ def main():
         run_serial_openrouter(questions, collection)
 
     elif args.mode == 'grade':
-        print("\nGrader Activated.")
+        print("\nGrader Mode: Preparing...")
         
-        #Grade GPT-5-Nano (Batch Results)
-        #Assumes you downloaded the batch output to 'gpt-5-rag-answers.jsonl'
+        #GRADE NANO: Logic: Check for the Temp name FIRST, then check for the Rubric name.
+        nano_file_to_grade = None
         if os.path.exists('gpt-5-rag-answers.jsonl'):
-            create_grading_batch(data, 'gpt-5-rag-answers.jsonl', 'grade_nano.jsonl')
+            nano_file_to_grade = 'gpt-5-rag-answers.jsonl'
+        elif os.path.exists(nano_final_file):
+             nano_file_to_grade = nano_final_file
+        
+        if nano_file_to_grade:
+            print(f"Found Nano Answers at: {nano_file_to_grade}")
+            create_grading_batch(data, nano_file_to_grade, 'grade_nano.jsonl')
             submit_batch_job('grade_nano.jsonl', description="grading-nano")
         else:
-            print("error: File not found")
+            print(f"Error: Could not find Nano answer file (looked for 'gpt-5-rag-answers.jsonl' or '{nano_final_file}')")
 
-        #Grade Qwen (Serial Results) catch mistakes
+        #GRADE QWEN
+        qwen_file_to_grade = None
         if os.path.exists('qwen-rag-answers.json'):
-            create_grading_batch(data, 'qwen-rag-answers.json', 'grade_qwen.jsonl')
+            qwen_file_to_grade = 'qwen-rag-answers.json'
+        elif os.path.exists(qwen_final_file):
+            qwen_file_to_grade = qwen_final_file
+
+        if qwen_file_to_grade:
+            print(f"Found Qwen Answers at: {qwen_file_to_grade}")
+            create_grading_batch(data, qwen_file_to_grade, 'grade_qwen.jsonl')
             submit_batch_job('grade_qwen.jsonl', description="grading-qwen")
         else:
-            print("error: File not found")
+            print(f"Error: Could not find Qwen answer file.")
+
     #Download Grading Results, required batch_id
     elif args.mode == 'download':
-        if not args.batch_id or not args.model_name:
+        if not args.batch_id:
             print("Error: You must provide --batch_id AND --model_name (nano or qwen)")
             return
 
-        # Determine the correct filename based on the model argument
-        if args.model_name == 'nano':
+        # CHECK manual output
+        if args.output_file:
+            target_file = args.output_file
+        elif args.model_name == 'nano':
             target_file = nano_final_file
         elif args.model_name == 'qwen':
             target_file = qwen_final_file
+        else:
+            print("Error: provide either --output_file OR --model_name")
+            return
         
         print(f"Attempting to download Batch {args.batch_id}...")
         print(f"Target Filename: {target_file}")
-        
-        # Reusing check_and_download function, saves the final JSON directly with the rubric name
+
+        #Reusing check_and_download function, saves the final JSON directly with the rubric name
         check_and_download_batch(args.batch_id, target_file)
 
+    #Score grading results (Accuracy check)
+    elif args.mode == 'score':
+        # Automatically looks for the files with today's date
+        print(f"Scoring files for date: {date_str}")
+        calculate_accuracy(nano_final_file)
+        calculate_accuracy(qwen_final_file)
 
 if __name__ == "__main__":
     main()
