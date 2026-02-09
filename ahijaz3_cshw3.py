@@ -1,3 +1,8 @@
+"""
+1. Learn how to leverage Retrieval Augmented Generation (RAG) with OpenAI embeddings.
+2. Learn how to leverage ChomaDB to leverage external information for better answers.
+"""
+
 import chromadb
 from chromadb.utils import embedding_functions
 import json
@@ -9,10 +14,6 @@ from datetime import datetime
 
 load_dotenv()
 client = OpenAI() #default client for batch
-"""
-1. Learn how to leverage Retrieval Augmented Generation (RAG) with OpenAI embeddings.
-2. Learn how to leverage ChomaDB to leverage external information for better answers.
-"""
 
 def get_context_chunks(data):
     """
