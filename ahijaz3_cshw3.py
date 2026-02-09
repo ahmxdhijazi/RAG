@@ -3,8 +3,12 @@ from chromadb.utils import embedding_functions
 import json
 from dotenv import load_dotenv
 import os
-load_dotenv()
+from openai import OpenAI
+import argparse
+from datetime import datetime
 
+load_dotenv()
+client = OpenAI() #default client for batch
 """
 1. Learn how to leverage Retrieval Augmented Generation (RAG) with OpenAI embeddings.
 2. Learn how to leverage ChomaDB to leverage external information for better answers.
@@ -46,6 +50,9 @@ def create_chromadb_collection(documents):
 def get_possible_qas(data, limit=500):
     """
     Extracts the first 'limit' questions where is_impossible is False.
+
+    REUSED FROM PREVIOUS HOMEWORK
+
     """
     results = []
     # Iterate through the main 'data' list (Topics)
@@ -70,28 +77,381 @@ def get_possible_qas(data, limit=500):
                     return results # immediately stop and return results
     return results
 
+def retrieve_context(collection, question):
+    """
+    Queries ChromaDB for the 5 most relevant chunks to the question.
+    """
+    #Query the collection
+    results = collection.query(
+        query_texts=[question],
+        n_results=5
+    )
+    #Chroma returns a dict: Need the first list inside 'documents'
+    documents = results['documents'][0]
+    
+    #Join them with newlines
+    return "\n\n".join(documents)
+
+def create_batch_file(batch_data, jsonl_filename, collection):
+    '''
+    PREPARE BATCH REQUEST FILE WITH RAG
+    '''
+    print(f"Creating batch file '{jsonl_filename}'")
+
+    with open(jsonl_filename, 'w', encoding='utf-8') as file:
+        for i, entry in enumerate(batch_data):
+            #RETRIEVE CONTEXT: We use the collection to find relevant chunks for this specific question
+            context_str = retrieve_context(collection, entry['question'])
+            
+            #COMBINE (RAG PROMPT): We explicitly label the Context and the Question for the model
+            rag_content = f"Context:\n{context_str}\n\nQuestion:\n{entry['question']}"
+
+            #Construct the API request
+            request_object = {
+                "custom_id": entry['id'],
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-5-nano",
+                    "reasoning_effort": "minimal",
+                    "messages": [
+                        #Prompting model to use the context effectively, in hopes of improving answer quality...
+                        {"role": "system", "content": "You are a helpful assistant. Answer the question using the provided context. Answer using only a short phrase, date, or entity."},
+                        {"role": "user", "content": rag_content} 
+                    ],
+                    "max_completion_tokens": 750 #increased token limit 
+                }
+            }
+            file.write(json.dumps(request_object) + '\n')
+
+def submit_batch_job(jsonl_filename, description="squad-rag-homework"):
+    """
+    UPLOAD BATCH FILE AND CREATE BATCH JOB
+    """
+    print("Uploading file to OpenAI.")
+    batch_file = client.files.create(
+      file=open(jsonl_filename, "rb"),
+      purpose="batch"
+    )
+
+    print(f"Creating Batch Job with File ID: {batch_file.id}...")
+    batch_job = client.batches.create(
+        input_file_id=batch_file.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+        metadata={"description": description}
+    )
+
+    print(f"Batch id {batch_job.id} \nSubmitted!\n")
+    return batch_job
+
+
+def run_serial_openrouter(questions, collection):
+    """
+    Run questions serially using OpenRouter with RAG context.
+    """
+    print(f"Starting serial run for {len(questions)} items.")
+    
+    # Specific client for OpenRouter
+    or_client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY")
+    )
+
+    results = []
+
+    for i, entry in enumerate(questions):
+
+        #Update user on progress per question... takes a while to run serially, so updates were cool
+        print(f"Processing {i+1}/{len(questions)}: ID {entry['id']}")
+        
+        #RETRIEVE CONTEXT: We use the collection to find relevant chunks for this specific question
+        context_str = retrieve_context(collection, entry['question'])
+        
+        #COMBINE (RAG PROMPT): We explicitly label the Context and the Question for the model
+        rag_content = f"Context:\n{context_str}\n\nQuestion:\n{entry['question']}"
+        
+        answer_text = ""
+        try:
+            completion = or_client.chat.completions.create(
+                model="qwen/qwen3-8b",
+                messages=[
+                    # Prompting model to use the context effectively...
+                    {"role": "system", "content": "You are a helpful assistant. Answer the question using the provided context. Answer using only a short phrase, date, or entity."},
+                    {"role": "user", "content": rag_content} 
+                ]
+            )
+            answer_text = completion.choices[0].message.content
+        except Exception as e:
+            print(f"Error: {e}")
+            
+        results.append({
+            "id": entry['id'],
+            "model_answer": answer_text
+        })
+
+    # Save Results
+    output_filename = "qwen-rag-answers.json"
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved serial results to {output_filename}")
+
+def create_grading_batch(squad_data, student_file, output_filename):
+    """
+    Reads student answers, compares them to SQuAD ground truth, 
+    and writes a Batch File for the Judge (GPT-5-mini) using Appendix 1 Prompt.
+    """
+    print(f"Preparing grading batch: {output_filename}")
+    
+    #Build Answer Key (Ground Truth)
+    ground_truth = {}
+    for title in squad_data['data']:
+        for paragraph in title['paragraphs']:
+            for qa in paragraph['qas']:
+                if not qa['is_impossible']:
+                    ground_truth[qa['id']] = {
+                        "question": qa['question'],
+                        "correct_answers": [ans['text'] for ans in qa['answers']]
+                    }
+
+    #Load Student Answers (Handle both JSONL and JSON formats)
+    student_answers = {}
+    
+    #Case 1: Deal with Batch Results (JSONL from GPT-5-nano)
+    if student_file.endswith('.jsonl'): 
+        try:
+            with open(student_file, 'r') as f:
+                for line in f:
+                    resp = json.loads(line)
+                    #Parse the deep batch API response structure
+                    ans = resp['response']['body']['choices'][0]['message']['content']
+                    q_id = resp['custom_id']
+                    student_answers[q_id] = ans
+        except FileNotFoundError:
+            print(f"Skipping {student_file} (File not found)")
+            return
+
+    #Case 2: Deal with Serial Results (JSON form Qwen)
+    else: 
+        try:
+            with open(student_file, 'r') as f:
+                data = json.load(f)
+                for entry in data:
+                    student_answers[entry['id']] = entry['model_answer']
+        except FileNotFoundError:
+            print(f"Skipping {student_file} (File not found)")
+            return
+
+    #Write Judge Requests
+    with open(output_filename, 'w') as f:
+        count = 0
+        for q_id, student_ans in student_answers.items():
+            if q_id not in ground_truth: continue 
+
+            truth = ground_truth[q_id]
+            
+            #Prompt from Appendix 1: Explicitly instructing the "judge"
+            user_content = f"""You are a teacher tasked with determining whether a student’s answer to a question was correct, based on a set of possible correct answers. You must only use the provided possible correct answers to determine if the student’s response was correct. Question: {truth['question']} Student’s Response: {student_ans} Possible Correct Answers: {truth['correct_answers']} Your response should only be a valid Json as shown below:
+{{
+"explanation" (str): A short explanation of why the student’s answer was correct or
+incorrect.,
+"score" (bool): true if the student’s answer was correct, false if it was incorrect
+}}
+Your response: """
+
+            #JSON Schema (include 'explanation' as requested in Appendix)
+            json_schema = {
+                "name": "grading_response",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "explanation": {"type": "string"},
+                        "score": {"type": "boolean"}
+                    },
+                    "required": ["explanation", "score"],
+                    "additionalProperties": False
+                }
+            }
+
+            #Constructing Request
+            req = {
+                "custom_id": q_id, 
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-5-mini", #The Judge
+                    "messages": [
+                        {"role": "user", "content": user_content}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": json_schema
+                    }
+                }
+            }
+            f.write(json.dumps(req) + '\n')
+            count += 1
+            
+    print(f"Prepared {count} grading requests.")
+
+
+def calculate_accuracy(filename):
+    """
+    Parses the final grading batch file and calculates the accuracy percentage.
+    """
+    print(f"\nCalculating Accuracy for: {filename}")
+    correct_count = 0
+    total_count = 0
+    
+    with open(filename, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                #Parse the OpenAI Batch Result (Line)
+                batch_entry = json.loads(line)
+                
+                #Extract the 'content' string from the response
+                content_str = batch_entry['response']['body']['choices'][0]['message']['content']
+                
+                #Parse the Judge's JSON output
+                judge_result = json.loads(content_str)
+                
+                if judge_result.get('score') is True:
+                    correct_count += 1
+                total_count += 1
+            except Exception as e:
+                continue
+        percentage = (correct_count / total_count) * 100
+        print(f"Score: {correct_count}/{total_count} ({percentage:.2f}%)")
+
+def check_and_download_batch(batch_id, output_filename):
+    """
+    Checks if a batch job is complete and downloads the results.
+    """
+    batch_job = client.batches.retrieve(batch_id)
+    print(f"Checking Batch {batch_id}... Status: {batch_job.status}")
+    
+    #If complete we should download the results, if failed we should print the error, otherwise we just say not ready yet.
+    if batch_job.status == 'completed' and batch_job.output_file_id:
+        print("Downloading results...")
+        content = client.files.content(batch_job.output_file_id).content
+        with open(output_filename, 'wb') as f:
+            f.write(content)
+        print(f"Saved to {output_filename}")
+        return True
+    elif batch_job.status == 'failed':
+        print(f"Batch Failed: {batch_job.errors}")
+        return False
+    else:
+        print("Job not ready yet.")
+        return False
+    
+
 def main():
+    #CLI Arguments Setup
+    parser = argparse.ArgumentParser(description="RAG Pipeline")
+    parser.add_argument('--mode', type=str, choices=['batch', 'serial', 'grade', 'download', 'score'], required=True)
+    parser.add_argument('--batch_id', type=str)
+    parser.add_argument('--model_name', type=str, choices=['nano', 'qwen'])
+    parser.add_argument('--output_file', type=str) #To hopefully fit the rubric naming scheme
+    args = parser.parse_args()
+
+    # Define Rubric Filenames
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    nano_final_file = f"gpt-5-nano-RAG-{date_str}-hw3.json"
+    qwen_final_file = f"qwen-3-8b-RAG-{date_str}-hw3.json"
+
+
     print("Loading JSON data from file (:")
     try: #attempt to retrieve the context chunks, if the file is not found, catch the error and update the user
-        with open('dev-v2.0.json', 'r', encoding='utf-8') as file:
-            data = json.load(file)
-        # Call the function and update the user
-        context_chunks = get_context_chunks(data)
-        print(f"Successfully loaded {len(context_chunks)} context chunks!") # All context chunks are stored
+        with open('dev-v2.0.json', 'r', encoding='utf-8') as file: data = json.load(file)
     except FileNotFoundError:
         print("Warning: 'dev-v2.0.json' not found. Ensure it is in the directory.")
-        data = None
         return # Exit the main function if the file is not found
 
 
-    # If data is successfully loaded, proceed to create the ChromaDB collection2
-    print(f"Building Database with {len(context_chunks)} chunks...")
-    collection = create_chromadb_collection(context_chunks)
-    print("Database Ready!")
+    if args.mode == 'batch':
+        # DB Setup needed for generation steps
+        context_chunks = get_context_chunks(data)
+        print(f"Building Database with {len(context_chunks)} chunks...")
+        collection = create_chromadb_collection(context_chunks)
+        # Extract 500 possible questions
+        questions = get_possible_qas(data)
+        print(f"Extracted {len(questions)} possible questions for the batch job.")
+        create_batch_file(questions, 'batch_requests.jsonl', collection)
+        submit_batch_job('batch_requests.jsonl')
 
-    # Extract 500 possible questions
-    questions = get_possible_qas(data)
-    print(f"Loaded {len(questions)} questions for testing.") #Length should be 500 to confirm
+    # RAG Serial Pipeline(Qwen)
+    elif args.mode == 'serial':
+        context_chunks = get_context_chunks(data)
+        print(f"Building Database with {len(context_chunks)} chunks...")
+        collection = create_chromadb_collection(context_chunks)
+        # Extract 500 possible questions
+        questions = get_possible_qas(data)
+        print(f"Extracted {len(questions)} possible questions for the serial run.")
+        
+        run_serial_openrouter(questions, collection)
+
+    elif args.mode == 'grade':
+        print("\nGrader Mode: Preparing...")
+        
+        #GRADE NANO: Logic: Check for the Temp name FIRST, then check for the Rubric name.
+        nano_file_to_grade = None
+        if os.path.exists('gpt-5-rag-answers.jsonl'):
+            nano_file_to_grade = 'gpt-5-rag-answers.jsonl'
+        elif os.path.exists(nano_final_file):
+             nano_file_to_grade = nano_final_file
+        
+        if nano_file_to_grade:
+            print(f"Found Nano Answers at: {nano_file_to_grade}")
+            create_grading_batch(data, nano_file_to_grade, 'grade_nano.jsonl')
+            submit_batch_job('grade_nano.jsonl', description="grading-nano")
+        else:
+            print(f"Error: Could not find Nano answer file (looked for 'gpt-5-rag-answers.jsonl' or '{nano_final_file}')")
+
+        #GRADE QWEN
+        qwen_file_to_grade = None
+        if os.path.exists('qwen-rag-answers.json'):
+            qwen_file_to_grade = 'qwen-rag-answers.json'
+        elif os.path.exists(qwen_final_file):
+            qwen_file_to_grade = qwen_final_file
+
+        if qwen_file_to_grade:
+            print(f"Found Qwen Answers at: {qwen_file_to_grade}")
+            create_grading_batch(data, qwen_file_to_grade, 'grade_qwen.jsonl')
+            submit_batch_job('grade_qwen.jsonl', description="grading-qwen")
+        else:
+            print(f"Error: Could not find Qwen answer file.")
+
+    #Download Grading Results, required batch_id
+    elif args.mode == 'download':
+        if not args.batch_id:
+            print("Error: You must provide --batch_id AND --model_name (nano or qwen)")
+            return
+
+        # CHECK manual output
+        if args.output_file:
+            target_file = args.output_file
+        elif args.model_name == 'nano':
+            target_file = nano_final_file
+        elif args.model_name == 'qwen':
+            target_file = qwen_final_file
+        else:
+            print("Error: provide either --output_file OR --model_name")
+            return
+        
+        print(f"Attempting to download Batch {args.batch_id}...")
+        print(f"Target Filename: {target_file}")
+
+        #Reusing check_and_download function, saves the final JSON directly with the rubric name
+        check_and_download_batch(args.batch_id, target_file)
+
+    #Score grading results (Accuracy check)
+    elif args.mode == 'score':
+        # Automatically looks for the files with today's date
+        print(f"Scoring files for date: {date_str}")
+        calculate_accuracy(nano_final_file)
+        calculate_accuracy(qwen_final_file)
 
 if __name__ == "__main__":
     main()
