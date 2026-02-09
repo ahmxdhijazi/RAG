@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import os
 from openai import OpenAI
 import argparse
+from datetime import datetime
 
 load_dotenv()
 client = OpenAI() #default client for batch
@@ -195,12 +196,171 @@ def run_serial_openrouter(questions, collection):
         json.dump(results, f, indent=2)
     print(f"Saved serial results to {output_filename}")
 
+def create_grading_batch(squad_data, student_file, output_filename):
+    """
+    Reads student answers, compares them to SQuAD ground truth, 
+    and writes a Batch File for the Judge (GPT-5-mini) using Appendix 1 Prompt.
+    """
+    print(f"Preparing grading batch: {output_filename}")
+    
+    #Build Answer Key (Ground Truth)
+    ground_truth = {}
+    for title in squad_data['data']:
+        for paragraph in title['paragraphs']:
+            for qa in paragraph['qas']:
+                if not qa['is_impossible']:
+                    ground_truth[qa['id']] = {
+                        "question": qa['question'],
+                        "correct_answers": [ans['text'] for ans in qa['answers']]
+                    }
+
+    #Load Student Answers (Handle both JSONL and JSON formats)
+    student_answers = {}
+    
+    #Case 1: Deal with Batch Results (JSONL from GPT-5-nano)
+    if student_file.endswith('.jsonl'): 
+        try:
+            with open(student_file, 'r') as f:
+                for line in f:
+                    resp = json.loads(line)
+                    #Parse the deep batch API response structure
+                    ans = resp['response']['body']['choices'][0]['message']['content']
+                    q_id = resp['custom_id']
+                    student_answers[q_id] = ans
+        except FileNotFoundError:
+            print(f"Skipping {student_file} (File not found)")
+            return
+
+    #Case 2: Deal with Serial Results (JSON form Qwen)
+    else: 
+        try:
+            with open(student_file, 'r') as f:
+                data = json.load(f)
+                for entry in data:
+                    student_answers[entry['id']] = entry['model_answer']
+        except FileNotFoundError:
+            print(f"Skipping {student_file} (File not found)")
+            return
+
+    #Write Judge Requests
+    with open(output_filename, 'w') as f:
+        count = 0
+        for q_id, student_ans in student_answers.items():
+            if q_id not in ground_truth: continue 
+
+            truth = ground_truth[q_id]
+            
+            #Prompt from Appendix 1: Explicitly instructing the "judge"
+            user_content = f"""You are a teacher tasked with determining whether a student’s answer to a question was correct, based on a set of possible correct answers. You must only use the provided possible correct answers to determine if the student’s response was correct. Question: {truth['question']} Student’s Response: {student_ans} Possible Correct Answers: {truth['correct_answers']} Your response should only be a valid Json as shown below:
+{{
+"explanation" (str): A short explanation of why the student’s answer was correct or
+incorrect.,
+"score" (bool): true if the student’s answer was correct, false if it was incorrect
+}}
+Your response: """
+
+            #JSON Schema (include 'explanation' as requested in Appendix)
+            json_schema = {
+                "name": "grading_response",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "explanation": {"type": "string"},
+                        "score": {"type": "boolean"}
+                    },
+                    "required": ["explanation", "score"],
+                    "additionalProperties": False
+                }
+            }
+
+            #Constructing Request
+            req = {
+                "custom_id": q_id, 
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-5-mini", #The Judge
+                    "messages": [
+                        {"role": "user", "content": user_content}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": json_schema
+                    }
+                }
+            }
+            f.write(json.dumps(req) + '\n')
+            count += 1
+            
+    print(f"Prepared {count} grading requests.")
+
+
+def calculate_accuracy(filename):
+    """
+    Parses the final grading batch file and calculates the accuracy percentage.
+    """
+    print(f"\nCalculating Accuracy for: {filename}")
+    correct_count = 0
+    total_count = 0
+    
+    with open(filename, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                #Parse the OpenAI Batch Result (Line)
+                batch_entry = json.loads(line)
+                
+                #Extract the 'content' string from the response
+                content_str = batch_entry['response']['body']['choices'][0]['message']['content']
+                
+                #Parse the Judge's JSON output
+                judge_result = json.loads(content_str)
+                
+                if judge_result.get('score') is True:
+                    correct_count += 1
+                total_count += 1
+            except Exception as e:
+                continue
+        percentage = (correct_count / total_count) * 100
+        print(f"Score: {correct_count}/{total_count} ({percentage:.2f}%)")
+
+def check_and_download_batch(batch_id, output_filename):
+    """
+    Checks if a batch job is complete and downloads the results.
+    """
+    batch_job = client.batches.retrieve(batch_id)
+    print(f"Checking Batch {batch_id}... Status: {batch_job.status}")
+    
+    #If complete we should download the results, if failed we should print the error, otherwise we just say not ready yet.
+    if batch_job.status == 'completed' and batch_job.output_file_id:
+        print("Downloading results...")
+        content = client.files.content(batch_job.output_file_id).content
+        with open(output_filename, 'wb') as f:
+            f.write(content)
+        print(f"Saved to {output_filename}")
+        return True
+    elif batch_job.status == 'failed':
+        print(f"Batch Failed: {batch_job.errors}")
+        return False
+    else:
+        print("Job not ready yet.")
+        return False
+    
 
 def main():
     #CLI Arguments Setup
     parser = argparse.ArgumentParser(description="RAG Pipeline")
-    parser.add_argument('--mode', type=str, choices=['batch', 'serial'], required=True)
+    parser.add_argument('--mode', type=str, choices=['batch', 'serial', 'grade', 'download', 'score'], required=True)
+    parser.add_argument('--batch_id', type=str)
+    parser.add_argument('--model_name', type=str, choices=['nano', 'qwen'])
+    parser.add_argument('--output_file', type=str) #To hopefully fit the rubric naming scheme
     args = parser.parse_args()
+
+    # Define Rubric Filenames
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    nano_final_file = f"gpt-5-nano-RAG-{date_str}-hw3.json"
+    qwen_final_file = f"qwen-3-8b-RAG-{date_str}-hw3.json"
+
 
     print("Loading JSON data from file (:")
     try: #attempt to retrieve the context chunks, if the file is not found, catch the error and update the user
@@ -209,29 +369,89 @@ def main():
         print("Warning: 'dev-v2.0.json' not found. Ensure it is in the directory.")
         return # Exit the main function if the file is not found
 
-    
-    context_chunks = get_context_chunks(data) #Call the function and update the user
-    print(f"Successfully loaded {len(context_chunks)} context chunks!") # All context chunks are stored
 
-    #Proceed to create the ChromaDB collection2
-    print(f"Building Database with {len(context_chunks)} chunks.")
-    collection = create_chromadb_collection(context_chunks)
-    print("Database Ready!")
-    
-    # Extract 500 possible questions
-    questions = get_possible_qas(data)
-    print(f"Loaded {len(questions)} questions for testing.") 
-
-    #Logic for RAG BATCH PIPELINE
     if args.mode == 'batch':
-        #Pass collection
+        # DB Setup needed for generation steps
+        context_chunks = get_context_chunks(data)
+        print(f"Building Database with {len(context_chunks)} chunks...")
+        collection = create_chromadb_collection(context_chunks)
+        # Extract 500 possible questions
+        questions = get_possible_qas(data)
+        print(f"Extracted {len(questions)} possible questions for the batch job.")
         create_batch_file(questions, 'batch_requests.jsonl', collection)
-        #call submit batch job function
         submit_batch_job('batch_requests.jsonl')
-    #Logic for RAG SERIAL PIPELINE
+
+    # RAG Serial Pipeline(Qwen)
     elif args.mode == 'serial':
+        context_chunks = get_context_chunks(data)
+        print(f"Building Database with {len(context_chunks)} chunks...")
+        collection = create_chromadb_collection(context_chunks)
+        # Extract 500 possible questions
+        questions = get_possible_qas(data)
+        print(f"Extracted {len(questions)} possible questions for the serial run.")
+        
         run_serial_openrouter(questions, collection)
-        #run_serial_openrouter(questions[:10], collection) #For testing
+
+    elif args.mode == 'grade':
+        print("\nGrader Mode: Preparing...")
+        
+        #GRADE NANO: Logic: Check for the Temp name FIRST, then check for the Rubric name.
+        nano_file_to_grade = None
+        if os.path.exists('gpt-5-rag-answers.jsonl'):
+            nano_file_to_grade = 'gpt-5-rag-answers.jsonl'
+        elif os.path.exists(nano_final_file):
+             nano_file_to_grade = nano_final_file
+        
+        if nano_file_to_grade:
+            print(f"Found Nano Answers at: {nano_file_to_grade}")
+            create_grading_batch(data, nano_file_to_grade, 'grade_nano.jsonl')
+            submit_batch_job('grade_nano.jsonl', description="grading-nano")
+        else:
+            print(f"Error: Could not find Nano answer file (looked for 'gpt-5-rag-answers.jsonl' or '{nano_final_file}')")
+
+        #GRADE QWEN
+        qwen_file_to_grade = None
+        if os.path.exists('qwen-rag-answers.json'):
+            qwen_file_to_grade = 'qwen-rag-answers.json'
+        elif os.path.exists(qwen_final_file):
+            qwen_file_to_grade = qwen_final_file
+
+        if qwen_file_to_grade:
+            print(f"Found Qwen Answers at: {qwen_file_to_grade}")
+            create_grading_batch(data, qwen_file_to_grade, 'grade_qwen.jsonl')
+            submit_batch_job('grade_qwen.jsonl', description="grading-qwen")
+        else:
+            print(f"Error: Could not find Qwen answer file.")
+
+    #Download Grading Results, required batch_id
+    elif args.mode == 'download':
+        if not args.batch_id:
+            print("Error: You must provide --batch_id AND --model_name (nano or qwen)")
+            return
+
+        # CHECK manual output
+        if args.output_file:
+            target_file = args.output_file
+        elif args.model_name == 'nano':
+            target_file = nano_final_file
+        elif args.model_name == 'qwen':
+            target_file = qwen_final_file
+        else:
+            print("Error: provide either --output_file OR --model_name")
+            return
+        
+        print(f"Attempting to download Batch {args.batch_id}...")
+        print(f"Target Filename: {target_file}")
+
+        #Reusing check_and_download function, saves the final JSON directly with the rubric name
+        check_and_download_batch(args.batch_id, target_file)
+
+    #Score grading results (Accuracy check)
+    elif args.mode == 'score':
+        # Automatically looks for the files with today's date
+        print(f"Scoring files for date: {date_str}")
+        calculate_accuracy(nano_final_file)
+        calculate_accuracy(qwen_final_file)
 
 if __name__ == "__main__":
     main()
